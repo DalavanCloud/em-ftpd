@@ -3,6 +3,7 @@
 require 'rubygems'
 gem 'eventmachine', '0.12.6'
 require 'eventmachine'
+require 'socket'
 
 # A demo FTP server, built on top of the EventMacine gem.
 #
@@ -42,8 +43,12 @@ module FTPServer
 
     # if we have a complete command, extract it from the buffer and process it
     if idx = @data.index(LBRK)
-      process_request(@data[0, idx + 1])
-      @data = @data[idx + 2, @data.size]
+      # schedule request processing to next tick or we can get synchronization errors
+      # with ftp transfer sockets
+      EM::next_tick do
+        process_request(@data[0, idx + 1])
+        @data = @data[idx + 2, @data.size]
+      end
     end
   end
 
