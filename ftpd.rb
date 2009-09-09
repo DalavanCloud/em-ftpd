@@ -20,16 +20,16 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
   COMMANDS = %w[quit type user retr stor port cdup cwd dele rmd pwd list size
                 syst mkd pass xcup xpwd xcwd xrmd rest allo nlst pasv allo help
                 noop mode rnfr rnto stru]
-  FILE_ONE = "This is the first file available for download.\n\nBy James"
-  FILE_TWO = "This is the file number two.\n\n2009-03-21"
-  attr_accessor :datasocket
+  attr_accessor :datasocket, :backend
 
+  def initialize backend
+    super
+    @backend = backend
+  end
   # callback recognised by EventMachine that is called when a new connection
   # is initiated
   #
   def post_init
-    @dir = "/"
-
     send_response "220 FTP server (rftpd) ready"
   end
 
@@ -112,22 +112,8 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
   # change directory
   def cmd_cwd(param)
     send_unautorised and return unless logged_in?
-    case param
-    when "/"
-      @dir = "/"
-      send_response "250 Directory changed to /"
-    when "."
-      send_response "250 Directory changed to #{@dir}"
-    when ".."
-      @dir = "/"
-      send_response "250 Directory changed to /"
-    when /^files.?/
-      if @dir.eql?("/")
-        @dir = "files"
-        send_response "250 Directory changed to files"
-      else
-        send_response "550 Directory not found"
-      end
+    if backend.cwd(param)
+      send_response "250 Directory changed to #{param}"
     else
       send_response "550 Directory not found"
     end
@@ -185,11 +171,10 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     send_illegal_params and return if param && param[/^\.\./]
     send_illegal_params and return if param && param[/^\//]
     send_response "150 Opening ASCII mode data connection for file list"
-    case @dir
-    when "/"
-      files = %w[. .. files one.txt]
-    when "files"
-      files = %w[. .. two.txt]
+
+    files = []
+    backend.list(param).each do |fname,stat|
+      files << fname
     end
 
     begin
@@ -208,18 +193,19 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     send_illegal_params and return if param && param[/^\//]
     send_response "150 Opening ASCII mode data connection for file list"
     lines = []
-    timestr = Time.now.strftime("%b %d %H:%M")
-    case @dir
-    when "/"
-      lines << "drwxr-xr-x 1 owner group            0 #{timestr} ."
-      lines << "drwxr-xr-x 1 owner group            0 #{timestr} .."
-      lines << "drwxr-xr-x 1 owner group            0 #{timestr} files"
-      lines << "-rwxr-xr-x 1 owner group#{FILE_ONE.size.to_s.rjust(13)} #{timestr} one.txt"
-    when "files"
-      lines << "drwxr-xr-x 1 owner group            0 #{timestr} ."
-      lines << "drwxr-xr-x 1 owner group            0 #{timestr} .."
-      lines << "-rwxr-xr-x 1 owner group#{FILE_TWO.size.to_s.rjust(13)} #{timestr} two.txt"
+    backend.list(param).each do |fname,stat|
+      amode = ((stat.mode & 040000) > 0) ? 'drwxr-xr-x' : '-rwxr-xr-x'
+      lines << sprintf( "%10s 1 %5s %5s %12d %s %s",
+                       amode,
+                       stat.uid,
+                       stat.gid,
+                       stat.size,
+                       stat.mtime.strftime("%b %d %H:%M"),
+                       fname
+                      )
     end
+
+    puts lines.join("\n")
 
     begin
       send_outofband_data(lines.join(LBRK) << LBRK)
@@ -227,7 +213,6 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
     rescue
       send_response "425 Error establishing connection"
     end
-
   end
 
   # handle the NOOP FTP command. This is essentially a ping from the client
@@ -251,7 +236,6 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
       return
     end
 
-    @dir = "/"
     @user = @requested_user
     @requested_user = nil
     send_response "230 OK, password correct"
@@ -308,7 +292,7 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
   # return the current directory
   def cmd_pwd(param)
     send_unautorised and return unless logged_in?
-    send_response "257 \"#{@dir}\" is the current directory"
+    send_response "257 \"#{backend.pwd}\" is the current directory"
   end
 
   # As per RFC1123, XPWD is a synonym for PWD
@@ -321,24 +305,16 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
 
   # send a file to the client
   def cmd_retr(param)
-    # safety checks to make sure clients can't request files they're
-    # not allowed to
     send_unautorised and return unless logged_in?
-    send_response "450 file not available" and return unless @dir.eql?("/") || @dir.eql?("files")
     send_param_required and return if param.nil?
     send_illegal_params and return if param && param[/^\.\./]
-    send_illegal_params and return if param && param[/^\//]
 
-    # if file exists, send it to the client
-    if @dir == "/" && param == "one.txt"
+    data = backend.retr(param)
+
+    if data
       send_response "150 Data transfer starting"
-      bytes = send_outofband_data(FILE_ONE)
+      bytes = send_outofband_data(data)
       send_response "226 Closing data connection, sent #{bytes} bytes"
-    elsif @dir == "files" && param == "two.txt"
-      send_response "150 Data transfer starting"
-      bytes = send_outofband_data(FILE_TWO)
-      send_response "226 Closing data connection, sent #{bytes} bytes"
-    # otherwise, inform the user the file doesn't exist
     else
       send_response "551 file not available"
     end
@@ -371,22 +347,10 @@ class FTPServer < EM::Protocols::LineAndTextProtocol
 
   # return the size of a file in bytes
   def cmd_size(param)
-    # safety checks to make sure clients can't request files they're
-    # not allowed to
     send_unautorised and return unless logged_in?
-    send_response "450 file not available" and return unless @dir.eql?("/") || @dir.eql?("files")
     send_response "553 action aborted. illegal filename" and return if param[/^\.\./]
-    send_response "553 action aborted. illegal filename" and return if param[/^\//]
-
-    # if file exists, send it to the client
-    if @dir == "/" && param == "one.txt"
-      send_response "213 #{FILE_ONE.size}"
-    elsif @dir == "files" && param == "two.txt"
-      send_response "213 #{FILE_TWO.size}"
-    else
-      # otherwise, inform the user the file doesn't exist
-      send_response "450 file not available"
-    end
+    size = backend.size(param)
+    send_response(size ? "213 #{size}" : "450 file not available")
   end
 
   # save a file from a client
@@ -570,35 +534,35 @@ class FTPPassiveDataSocket < EventMachine::Connection
 end
 
 # if this file was run directly, spin up eventmachine on port 21
-if $0 == __FILE__
-
-  # signal handling, ensure we exit gracefully
-  trap "SIGCLD", "IGNORE"
-  trap "INT" do
-    puts "exiting..."
-    puts
-    EventMachine::run
-    exit
-  end
-
-  uid, gid = *ARGV
-  uid = uid.to_i if uid
-  gid = gid.to_i if gid
-
-  EventMachine::run do
-    puts "Starting ftp server on 0.0.0.0:21"
-    EventMachine::start_server("0.0.0.0", 21, FTPServer)
-
-    # once the server has spun up, change the owner of process
-    # for security reasons. I don't even trust my own code to
-    # run as root, let alone my code that's running an Internet
-    # visible network service.
-    if gid && Process.gid == 0
-      Process.gid = gid
-    end
-    if uid && Process.euid == 0
-      Process::Sys.setuid(uid)
-    end
-
-  end
-end
+#if $0 == __FILE__
+#
+#  # signal handling, ensure we exit gracefully
+#  trap "SIGCLD", "IGNORE"
+#  trap "INT" do
+#    puts "exiting..."
+#    puts
+#    EventMachine::run
+#    exit
+#  end
+#
+#  uid, gid = *ARGV
+#  uid = uid.to_i if uid
+#  gid = gid.to_i if gid
+#
+#  EventMachine::run do
+#    puts "Starting ftp server on 0.0.0.0:21"
+#    EventMachine::start_server("0.0.0.0", 2021, FTPServer)
+#
+#    # once the server has spun up, change the owner of process
+#    # for security reasons. I don't even trust my own code to
+#    # run as root, let alone my code that's running an Internet
+#    # visible network service.
+#    if gid && Process.gid == 0
+#      Process.gid = gid
+#    end
+#    if uid && Process.euid == 0
+#      Process::Sys.setuid(uid)
+#    end
+#
+#  end
+#end
