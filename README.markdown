@@ -1,3 +1,9 @@
+
+# Changes by zed_0xff
+
+- Splitted daemon into a frontend (FTP daemon) and backend (VFS) parts
+- Provided two example backends - a complete memory-based virtual one, and one that reads real filesystem
+
 ## ftpd.rb
 
 A demo FTP server, built on top of the EventMacine gem. For a few years I've run
@@ -15,7 +21,7 @@ This isn't a useful FTP server. It has hard coded authentication and an
 emulated directory structure. I hope it serves as a useful piece of sample code
 regardless.
 
-# Author
+# Original Author
 
 James Healy <james@yob.id.au>
 [http://www.yob.id.au](http://www.yob.id.au)
